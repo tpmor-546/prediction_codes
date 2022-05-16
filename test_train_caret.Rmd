@@ -1,5 +1,6 @@
 ---
-title: "R Notebook"
+title: "Prediction of linear outcome using caret pipeline"
+author: "Timothy P Morris PhD, Northeastern University" 
 output: html_notebook
 editor_options: 
   chunk_output_type: console
