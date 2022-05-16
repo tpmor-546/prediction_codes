@@ -1,0 +1,192 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+# load all necessary libraries 
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+library(dplyr)
+library(selectiveInference)
+library(glmnet)
+library(caret)
+library(randomForest)
+library(tidyverse)
+library(purrr)
+```
+# 1. Import data (you may need to do some data wrangling prior to this)
+```{r}
+setwd("/Users/timothymorris/iCloud/Codes_R/prediction_codes") # set your working dir (where your data is)
+
+load(file = "multimodal_randomforest.Rdata") # example Rdata file
+
+```
+# 2. Split the data into test/train split 
+```{r}
+set.seed(455)
+# create data partition
+training.samples <- multimodal$Adherence %>% # provide the outcome measure (what you are trying to predict)
+  createDataPartition(p = 0.80, list = FALSE) # splits the data into 80% training and 20% testing (can be changed)
+train.data  <- multimodal[training.samples, ] # creates train data
+test.data <- multimodal[-training.samples, ] # creates test data
+```
+# 3. Regress out age, gender and meanFD from imaging data (meanFD for fmri only) in test and train
+```{r}
+# we are going to regress out variables from the imaging data in the test and train sets separately. If you have both structural and functional data (like the example) then here is 4 sets of code you can regress out age/sex/meanFD from the functional and just age and sex from the structural. 
+
+#fmri train
+varlist <- names(train.data)[2:301] # creates var name list (2:301 for imaging, 306:441 for structural)
+
+models <- lapply(varlist1, function(x) {
+  lm(substitute(i ~ age + gender + meanFD, list(i = as.name(x))), data = train.data)
+})
+
+list_resid = lapply(models, resid) #  
+df_resid = do.call(cbind.data.frame, list_resid)
+
+curnames <-names(df_resid)
+df_resid <- as_tibble(df_resid)
+
+fmri_train <- df_resid %>% rename_at(vars(curnames), ~ varlist)
+
+#fmri test
+varlist <- names(test.data)[2:301] # creates var name list (2:301 for imaging, 306:441 for structural)
+
+models <- lapply(varlist2, function(x) {
+  lm(substitute(i ~ age + gender + meanFD, list(i = as.name(x))), data = test.data)
+})
+
+list_resid = lapply(models, resid) #  
+df_resid = do.call(cbind.data.frame, list_resid)
+
+curnames <-names(df_resid)
+df_resid <- as_tibble(df_resid)
+
+fmri_test <- df_resid %>% rename_at(vars(curnames), ~ varlist)
+
+# structural train
+varlist <- names(train.data)[305:439] # creates var name list (2:301 for imaging, 306:441 for structural)
+
+models <- lapply(varlist3, function(x) {
+  lm(substitute(i ~ age + gender, list(i = as.name(x))), data = train.data)
+})
+
+list_resid = lapply(models, resid) #  
+df_resid = do.call(cbind.data.frame, list_resid)
+
+curnames <-names(df_resid)
+df_resid <- as_tibble(df_resid)
+
+struct_train <- df_resid %>% rename_at(vars(curnames), ~ varlist)
+
+#structural test
+varlist <- names(test.data)[305:439] # creates var name list (2:301 for imaging, 306:441 for structural)
+
+models <- lapply(varlist4, function(x) {
+  lm(substitute(i ~ age + gender, list(i = as.name(x))), data = test.data)
+})
+
+list_resid = lapply(models, resid) #  
+df_resid = do.call(cbind.data.frame, list_resid)
+
+curnames <-names(df_resid)
+df_resid <- as_tibble(df_resid)
+
+struct_test <- df_resid %>% rename_at(vars(curnames), ~ varlist)
+
+# put back together
+train.data1 <- cbind(fmri_train, struct_train)
+train.data1['Adherence'] <- train.data$Adherence # append adherence
+
+test.data1 <- cbind(fmri_test, struct_test)
+test.data1['Adherence'] <- test.data$Adherence # append adherence
+```
+# 4. Manual feature selection: Univariate filter 
+```{r}
+# manual feature selection
+
+per_s <- data.frame(scaled.dat <- scale(train.data1)) # centers and scales variables
+
+varlist <- names(per_s)[-437] # creates var name list minus adherene var
+models <- lapply(varlist, function(x) {
+  lm(substitute(Adherence ~ i, list(i = as.name(x))), data = per_s)
+})
+lapply(models, summary) # applys funciton models to all vars in per_s and prints summary output
+p <- (sapply(models, function(x) summary(x)$coefficients[,4])) # creates list of pvalues from each model
+#coefs <- (sapply(models, function(x) summary(x)$coefficients[,4])) # creates list of pvalues from each model
+p <-unlist(p) # unlists pvalues
+pvals <- p[seq(0,length(p),2)] # selects just pvalues (there was the intercept in every other space)
+pvalues <- tibble(varlist,pvals) # creates tibble of vars + pvalues
+pvaldat <- pvalues %>% 
+  filter(pvals < 0.05) # selects just those vars that correlate with outcome at p<0.05 *can chnage to 0.1*
+pvarlist <- pvaldat$varlist # creates varlist with just those vars at p<0.05
+train.data2 <- train.data1 %>% dplyr::select(all_of(pvarlist)) # selects just those vars from comeplte tibble and forms final train data to use in models
+train.data2['Adherence'] <- train.data1$Adherence # append adherence
+
+# reduce test.data1 to match vars selected by univariate in train.data1
+test.data2 <- test.data1 %>% dplyr::select(all_of(pvarlist)) # final test data for use in models
+test.data2['Adherence'] <- test.data1$Adherence # append adherence
+```
+# 5. ELASTIC NET MODEL (caret) 
+``` {r echo=FALSE}
+# Build the model using the training set
+set.seed(456)
+model <- train(
+  Adherence ~., data = train.data2, method = "glmnet",
+  trControl = trainControl("cv", number = 10),
+  preProc = c("center", "scale"),
+  tuneLength = 10
+)
+# Best tuning parameter
+lambda<-model$bestTune$lambda
+alpha<-model$bestTune$alpha
+
+#Function to extract internal model performance at optimal lambda and alpha 
+get_best_result = function(caret_fit) {
+  best = which(rownames(caret_fit$results) == rownames(caret_fit$bestTune))
+  best_result = caret_fit$results[best, ]
+  rownames(best_result) = NULL
+  best_result
+}
+get_best_result(model)
+
+# coefficients (must supply best lambda)
+coef(model$finalModel, model$bestTune$lambda)
+#plot(model$finalModel)
+# Make predictions on the test data
+x.test <- model.matrix(sedtmchg ~., test.data2)[,-1]
+predictions <- model %>% predict(x.test)
+# Model performance metrics
+data.frame(
+  RMSE = RMSE(predictions, test.data2$sedtmchg),
+  Rsquare = R2(predictions, test.data2$sedtmchg),
+  MAE = MAE(predictions, test.data2$sedtmchg)
+)
+
+```
+#RANDOM forest
+```{r echo=FALSE}
+# Fit the model on the training set
+set.seed(123)
+model <- train(
+  sedtmchg ~., data = train.data2, method = "rf",
+  trControl = trainControl("repeatedcv", number = 10, )
+  )
+# Best tuning parameter mtry
+model$bestTune
+model$finalModel
+# Make predictions on the test data
+predictions <- model %>% predict(test.data2)
+head(predictions)
+# Compute the average prediction error RMSE
+RMSE(predictions, test.data2$sedtmchg)
+R2(predictions, test.data2$sedtmchg)
+#var importance
+importance(model$finalModel)
+varImp(model)
+# Plot MeanDecreaseAccuracy
+varImpPlot(model$finalModel, type = 1)
+# Plot MeanDecreaseGini
+varImpPlot(model$finalModel, type = 2)
+```
+
