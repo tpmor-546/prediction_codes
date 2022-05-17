@@ -1,0 +1,217 @@
+---
+title: "Prediction of linear and binary outcomes using elastic net and nested CV"
+author: "Timothy P Morris PhD"
+date: "01/25/2022"
+output:
+  pdf_document: default
+  html_document: default
+editor_options:
+  chunk_output_type: console
+---
+#load libraries
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+library(dplyr)
+library(selectiveInference)
+library(glmnet)
+library(caret)
+library(randomForest)
+library(tidyverse)
+library(caret)
+library(gam)
+library(penalized)
+library(pensim)
+```
+# 1. load data
+```{r}
+setwd("/Users/timothymorris/iCloud/Codes_R/prediction_codes") # set your working dir (where your data is)
+
+load(file = "multimodal_randomforest.Rdata") # example Rdata file 
+```
+# 2. regress out age, gender and meanFD from imaging data (meanFD for fmri only) 
+```{r}
+# NOTE: must change train.data_x in certain places to correspond to each each dataset you are controlling for and must change formula for fmri vs structural models
+#fMRI data
+varlist <- names(multimodal)[2:301] # creates var name list (2:301 for imaging, 306:441 for structural)
+
+models <- lapply(varlist, function(x) {
+  lm(substitute(i ~ age + gender + meanFD, list(i = as.name(x))), data = multimodal)
+})
+list_resid = lapply(models, resid) #  
+df_resid = do.call(cbind.data.frame, list_resid)
+
+curnames <-names(df_resid)
+df_resid <- as_tibble(df_resid)
+
+fmri <- df_resid %>% rename_at(vars(curnames), ~ varlist)
+
+#Structural data
+varlist <- names(multimodal)[305:439] # creates var name list (2:301 for imaging, 306:441 for structural)
+
+models <- lapply(varlist, function(x) {
+  lm(substitute(i ~ age + gender, list(i = as.name(x))), data = multimodal)
+})
+list_resid = lapply(models, resid) #  
+df_resid = do.call(cbind.data.frame, list_resid)
+
+curnames <-names(df_resid)
+df_resid <- as_tibble(df_resid)
+
+struct <- df_resid %>% rename_at(vars(curnames), ~ varlist)
+
+# put back together
+multimodal1 <- cbind(fmri, struct)
+multimodal1['Adherence'] <- multimodal$Adherence # append adherence
+```
+# 3. manual feature selection: selection by filtering (within corss-validation folds)
+```{r}
+#creates function to select only vars in training set that corr with outcome at p0.1
+mySBF <- caretSBF
+mySBF$filter <- function(score, x, y) { score <= 0.1 }
+#runs SBF 
+set.seed(123) # sets seed for k-fold splits- must be same as seed for models below
+bmmdl <- sbf(
+  Adherence ~ .,
+  data = multimodal, 
+  method = "lm", 
+  preProc = c("center", "scale"),
+  trControl = trainControl(method = "none"),
+  sbfControl = sbfControl(functions = mySBF, verbose = FALSE, method = 'cv', number = 10))
+#list selected vars
+bmmdl$variables$selectedVars
+bmmdl$optVariables
+prop_included = rowMeans(sapply(bmmdl$variables,function(i)bmmdl$coefnames %in% i))
+#create list of features that are selected in 80% of the time across training folds
+selected = bmmdl$coefnames[prop_included > 0.80]
+sbf_mm <- multimodal %>% dplyr::select(all_of(selected))
+sbf_mm['Adherence'] <- multimodal$Adherence # append adherence
+```
+# 4. build model: Pensim with nested CV 
+```{r}
+out <- sbf_mm$Adherence
+data <- sbf_mm[-37]
+
+set.seed(456) # needs to be same as mySBF models above
+preds <-
+  opt.nested.crossval(
+    outerfold = 10,
+    nprocessors = 1,
+    #opt.nested.crossval arguments
+    optFUN = "opt2D",
+    scaling = TRUE,
+    #opt.splitval arguments
+    nsim = 25,
+    L1range = c(0.1, 1),
+    L2range = c(1, 100),
+    dofirst = "both",
+    L1gridsize = 10, L2gridsize = 10,
+    #opt1D arguments
+    response = out,
+    #rest are penalized::optl1 arguments
+    penalized = data,
+    fold = 10,
+    positive = FALSE,
+    standardize = TRUE,
+    trace = FALSE,
+  )
+
+ # extract coeficients
+coefs <- pensim::opt2D(
+    #opt.splitval arguments
+    nsim = 25,
+    L1range = c(0.1, 1),
+    L2range = c(1, 100),
+    dofirst = "both",
+    L1gridsize = 10, L2gridsize = 10,
+    #opt1D arguments
+    response = out,
+    #rest are penalized::optl1 arguments
+    penalized = data,
+    fold = 10,
+    positive = FALSE,
+    standardize = TRUE,
+    trace = FALSE
+)
+
+# performance metrics 
+metricsm <- data.frame(R2 = caret::R2(preds, out), 
+            RMSE = RMSE(preds, out),
+            MAE = MAE(preds, out))
+metricsm
+
+mm_metrics <- metricsm 
+
+resultm <- as_tibble(sbf_mm$Adherence)
+resultm["preds"] <- preds
+resultm <- resultm %>% rename(Adherence = value)
+scatterplot(resultm, preds, Adherence, "Predicted", "Observed") # need to run scatterplot funciton in "plots" chunk below
+mm_coefs <- coefs
+mm_coefs <- mm_coefs[4, 1:35] 
+cor.test(resultm$Adherence, resultm$preds) # gives simple correlation between proedicted and observed values
+
+```
+## Random permutation to compare obsrved model metrics to permuted datsets
+```{r}
+# Permutes the oberseved vs predicted values 1000 times and outputs a null distribution of predicitons and a p-vlue comparing the actual prediction vs the null distribution: p-value of the permutation test is calculated as the proportion of sampled permutations that are greater or equal to the true prediction correlation.
+
+#replace result with df1 for imaging and 
+# permute obs v pred
+null_distribution_simulated <- resultm %>%
+  specify(response = Adherence, explanatory = preds) %>%
+  hypothesize(null = "independence") %>%
+  generate(reps = 10000, type = "permute") %>%
+  calculate(stat = "correlation")
+
+null_distribution_simulated %>%
+  visualize()
+
+obs_cor <- resultm %>%
+  specify(response = Adherence, explanatory = preds) %>%
+  calculate(stat = "correlation")
+
+null_distribution_simulated %>%
+  visualize() +
+  shade_p_value(obs_stat = obs_cor, direction = "two-sided")
+
+p_value <- null_distribution_simulated %>%
+  get_p_value(obs_stat = obs_cor, direction = "two-sided")
+
+p_value
+
+
+boot_dist <- result %>%
+  specify(response = Adherence, explanatory = predicted) %>%
+  generate(reps = 1000, type = "bootstrap") %>%
+  calculate(stat = "correlation")
+
+ci <- boot_dist %>%
+  # calculate the confidence interval around the point estimate
+  get_confidence_interval(point_estimate = obs_cor,
+                          # at the 95% confidence level
+                          level = .95,
+                          # using the standard error
+                          type = "se")
+
+ci
+
+```
+# plots
+```{r}
+library(rlang)
+library(ggplot2)
+scatterplot <- function(dataframe, x, y, ylab, xlab) {
+  ggplot(data = dataframe, aes(x={{x}}, y = {{y}})) + 
+    geom_point(color =  "#663399") + 
+    theme(
+      # Hide panel borders and remove grid lines
+      panel.border = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background = element_blank(),
+      # Change axis line
+      axis.line = element_line(colour = "black")
+    ) +
+    labs(y=ylab, x = xlab) +
+    stat_smooth(method = "lm", col = "#cc8400")
+}
+```
+
